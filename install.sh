@@ -18,6 +18,10 @@ if [ -s requirements.txt ]; then
   .venv/bin/python -m pip install -r requirements.txt
 fi
 
+if .venv/bin/python -c "import playwright" >/dev/null 2>&1; then
+  .venv/bin/python -m playwright install chromium
+fi
+
 mkdir -p docs logs launchd
 
 if [ ! -f .env ]; then
@@ -58,4 +62,4 @@ echo "Done."
 echo "Next steps:"
 echo "1. Edit .env if you want Telegram notification."
 echo "2. Run ./run.sh"
-echo "3. Open docs/worldcup-2026-agent-report.html"
+echo "3. Open docs/worldcup-2026-agent-report.html or view docs/worldcup-2026-agent-report.png"

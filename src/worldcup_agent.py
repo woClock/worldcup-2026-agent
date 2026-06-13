@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Generate a 2026 World Cup prediction and lottery EV HTML report.
 
-This script intentionally uses only the Python standard library so the project
-is easy to install on a clean machine.
+The report renderer uses Playwright to create a PNG screenshot for Telegram.
 """
 
 from __future__ import annotations
@@ -13,8 +12,8 @@ import html
 import json
 import os
 import re
-import ssl
 import sys
+import uuid
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib import parse, request
@@ -409,7 +408,52 @@ th {{ background: #eef3f8; text-align: left; }}
 """
 
 
-def send_telegram_link(env: Dict[str, str], report_url: str, generated_at: dt.datetime) -> None:
+def render_report_screenshot(report_path: Path, screenshot_path: Path) -> bool:
+    """Render the HTML report to a full-page PNG screenshot.
+
+    Playwright is imported lazily so the analysis/report generation still works
+    even if a user has not installed screenshot support yet.
+    """
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        print(f"Screenshot skipped: Playwright is not available ({exc}).", file=sys.stderr)
+        return False
+
+    screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page(viewport={"width": 1280, "height": 1600}, device_scale_factor=1)
+        page.goto(report_path.resolve().as_uri(), wait_until="networkidle")
+        page.screenshot(path=str(screenshot_path), full_page=True)
+        browser.close()
+    return True
+
+
+def multipart_body(fields: Dict[str, str], file_field: str, file_path: Path) -> Tuple[bytes, str]:
+    boundary = f"----WorldCupAgent{uuid.uuid4().hex}"
+    chunks: List[bytes] = []
+    for key, value in fields.items():
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
+        chunks.append(value.encode("utf-8"))
+        chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+    chunks.append(
+        (
+            f'Content-Disposition: form-data; name="{file_field}"; '
+            f'filename="{file_path.name}"\r\n'
+            "Content-Type: image/png\r\n\r\n"
+        ).encode("utf-8")
+    )
+    chunks.append(file_path.read_bytes())
+    chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(chunks), boundary
+
+
+def send_telegram_screenshot(env: Dict[str, str], screenshot_path: Path, generated_at: dt.datetime) -> None:
     if env.get("SEND_TELEGRAM", "0") not in {"1", "true", "TRUE", "yes"}:
         return
     token = env.get("TELEGRAM_BOT_TOKEN", "")
@@ -417,23 +461,33 @@ def send_telegram_link(env: Dict[str, str], report_url: str, generated_at: dt.da
     if not token or not chat_id:
         print("Telegram skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing.", file=sys.stderr)
         return
-    text = (
+    if not screenshot_path.exists():
+        print(f"Telegram skipped: screenshot does not exist: {screenshot_path}", file=sys.stderr)
+        return
+
+    caption = (
         "世界杯每日预测更新\n"
         f"生成时间：{generated_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"HTML 报告地址：{report_url}\n"
-        "完整内容请打开 HTML 报告查看。"
+        "完整报告截图见图片。"
     )
-    payload = parse.urlencode(
+    payload, boundary = multipart_body(
         {
             "chat_id": chat_id,
-            "text": text,
+            "caption": caption,
             "disable_web_page_preview": "true",
-        }
-    ).encode("utf-8")
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+        },
+        "photo",
+        screenshot_path,
+    )
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
 
     def post(opener: request.OpenerDirector) -> None:
-        req = request.Request(url, data=payload, method="POST")
+        req = request.Request(
+            url,
+            data=payload,
+            method="POST",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
         with opener.open(req, timeout=20) as resp:
             body = json.loads(resp.read().decode("utf-8", errors="ignore"))
         if not body.get("ok"):
@@ -461,6 +515,7 @@ def main() -> int:
     env = {**os.environ, **load_env(ROOT / args.env)}
     odds_url = env.get("ODDS_URL", DEFAULT_ODDS_URL)
     report_path = ROOT / env.get("REPORT_PATH", "docs/worldcup-2026-agent-report.html")
+    screenshot_path = ROOT / env.get("REPORT_SCREENSHOT_PATH", "docs/worldcup-2026-agent-report.png")
     report_url = env.get("REPORT_URL") or report_path.resolve().as_uri()
 
     model = load_model(ROOT / "config" / "model_probabilities.json")
@@ -477,8 +532,11 @@ def main() -> int:
     report = generate_report(rows, odds_url, generated_at)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report, encoding="utf-8")
-    send_telegram_link(env, report_url, generated_at)
+    screenshot_ok = render_report_screenshot(report_path, screenshot_path)
+    send_telegram_screenshot(env, screenshot_path, generated_at)
     print(f"Report written: {report_path}")
+    if screenshot_ok:
+        print(f"Screenshot written: {screenshot_path}")
     print(f"Report URL: {report_url}")
     return 0
 

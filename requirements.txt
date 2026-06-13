@@ -1,2 +1,1 @@
-# The agent currently uses only the Python standard library.
-# Keep this file for future data connectors, model clients, or dashboard dependencies.
+playwright>=1.44.0
