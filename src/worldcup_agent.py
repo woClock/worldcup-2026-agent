@@ -10,6 +10,7 @@ import argparse
 import datetime as dt
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -84,6 +85,66 @@ def parse_float_triplet(part: str) -> List[float]:
     return nums[:3]
 
 
+def poisson_probs(lam: float, max_goals: int = 7) -> List[float]:
+    return [math.exp(-lam) * (lam ** goals) / math.factorial(goals) for goals in range(max_goals + 1)]
+
+
+def score_grid(home_lam: float, away_lam: float, max_goals: int = 7) -> List[Tuple[int, int, float]]:
+    home_probs = poisson_probs(home_lam, max_goals)
+    away_probs = poisson_probs(away_lam, max_goals)
+    grid = [(h, a, home_probs[h] * away_probs[a]) for h in range(max_goals + 1) for a in range(max_goals + 1)]
+    total = sum(prob for _, _, prob in grid)
+    return [(h, a, prob / total) for h, a, prob in grid]
+
+
+def score_prediction_from_wdl(probabilities: Tuple[float, float, float]) -> dict:
+    """Infer a simple Poisson score model from W/D/L probabilities.
+
+    This is a transparent approximation, not a calibrated score market. It is
+    sufficient for ranking likely scores and checking whether a W/D/L view
+    implies a low- or high-scoring game.
+    """
+
+    best_error = float("inf")
+    best_lambdas = (1.35, 1.10)
+    # Search realistic international football scoring ranges.
+    values = [round(0.25 + step * 0.05, 2) for step in range(76)]
+    for home_lam in values:
+        for away_lam in values:
+            home_win = draw = away_win = 0.0
+            for home_goals, away_goals, prob in score_grid(home_lam, away_lam, max_goals=6):
+                if home_goals > away_goals:
+                    home_win += prob
+                elif home_goals == away_goals:
+                    draw += prob
+                else:
+                    away_win += prob
+            error = (
+                (home_win - probabilities[0]) ** 2
+                + (draw - probabilities[1]) ** 2
+                + (away_win - probabilities[2]) ** 2
+            )
+            if error < best_error:
+                best_error = error
+                best_lambdas = (home_lam, away_lam)
+
+    grid = score_grid(best_lambdas[0], best_lambdas[1], max_goals=7)
+    top_scores = sorted(grid, key=lambda item: item[2], reverse=True)[:3]
+    over_25 = sum(prob for home_goals, away_goals, prob in grid if home_goals + away_goals >= 3)
+    both_score = sum(prob for home_goals, away_goals, prob in grid if home_goals > 0 and away_goals > 0)
+    return {
+        "lambda_home": best_lambdas[0],
+        "lambda_away": best_lambdas[1],
+        "top_scores": top_scores,
+        "over_25": over_25,
+        "both_score": both_score,
+    }
+
+
+def score_text(prediction: dict) -> str:
+    return " / ".join(f"{home}-{away} ({pct(prob, 1)})" for home, away, prob in prediction["top_scores"])
+
+
 def parse_odds_page(page: str, model: Dict[Tuple[str, str], Tuple[float, float, float]]) -> List[dict]:
     blocks = re.findall(r'(<tr\b(?=[^>]*\bm="世界杯")[\s\S]*?</tr>)', page, flags=re.I)
     rows: List[dict] = []
@@ -130,6 +191,7 @@ def parse_odds_page(page: str, model: Dict[Tuple[str, str], Tuple[float, float, 
                 "normal_odds": normal_odds,
                 "handicap_odds": handicap_odds,
                 "ev": ev,
+                "score_prediction": score_prediction_from_wdl(probs),
             }
         )
     return sorted(rows, key=lambda r: (r["match_time"], r["num"]))
@@ -247,6 +309,7 @@ def row_html(row: dict) -> str:
         f"<td>{html.escape(row['match_time'])}</td>"
         f"<td>{html.escape(row['home'])} vs {html.escape(row['away'])}</td>"
         f"<td>{probability_text}</td>"
+        f"<td>{html.escape(score_text(row['score_prediction']))}</td>"
         f"<td>{html.escape(odds_text(row['normal_odds']))}</td>"
         f"<td>{ev_cells}</td>"
         f"<td>{html.escape(best_ev_remark(row))}</td>"
@@ -265,6 +328,7 @@ def generate_report(rows: List[dict], odds_url: str, generated_at: dt.datetime) 
         f"<td>{html.escape(row['match_time'])}</td>"
         f"<td>{html.escape(row['home'])} vs {html.escape(row['away'])}</td>"
         f"<td>{' / '.join(pct(x) for x in row['probabilities'])}</td>"
+        f"<td>{html.escape(score_text(row['score_prediction']))}</td>"
         f"<td>{html.escape(odds_text(row['normal_odds']))}</td>"
         f"<td>{html.escape(best_ev_remark(row))}</td>"
         "</tr>"
@@ -340,7 +404,7 @@ th {{ background: #eef3f8; text-align: left; }}
 
 <section id="matches-24h">
 <h2>今日/未来 24 小时重点比赛</h2>
-<table><thead><tr><th>开赛时间</th><th>场次</th><th>模型胜平负概率</th><th>当前不让球赔率</th><th>判断</th></tr></thead><tbody>
+<table><thead><tr><th>开赛时间</th><th>场次</th><th>模型胜平负概率</th><th>最可能比分</th><th>当前不让球赔率</th><th>判断</th></tr></thead><tbody>
 {focus_rows}
 </tbody></table>
 </section>
@@ -357,7 +421,7 @@ th {{ background: #eef3f8; text-align: left; }}
 
 <section id="remaining-probabilities">
 <h2>当前剩余可售世界杯场次模型胜平负概率</h2>
-<table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>模型胜平负概率（主胜/平/客胜）</th><th>当前不让球赔率（主胜/平/客胜）</th><th>EV（主胜/平/客胜）</th><th>备注</th></tr></thead><tbody>
+<table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>模型胜平负概率（主胜/平/客胜）</th><th>最可能比分</th><th>当前不让球赔率（主胜/平/客胜）</th><th>EV（主胜/平/客胜）</th><th>备注</th></tr></thead><tbody>
 {''.join(row_html(row) for row in rows)}
 </tbody></table>
 </section>
